@@ -13,16 +13,22 @@ import { IMasterWombat } from "../interfaces/wombat/IMasterWombat.sol";
 import { IVeWom } from "../interfaces/wombat/IVeWom.sol";
 import { IMWom } from "../interfaces/wombat/IMWom.sol";
 import { IAsset } from "../interfaces/wombat/IAsset.sol";
+import { Address } from "@openzeppelin/contracts/utils/Address.sol";
 
 import "../interfaces/IMintableERC20.sol";
 import "../interfaces/IPoolHelper.sol";
 import "../interfaces/IBaseRewardPool.sol";
 import "../interfaces/IMasterMagpie.sol";
+import "../interfaces/IConverter.sol";
 import "../libraries/ERC20FactoryLib.sol";
 import "../libraries/PoolHelperFactoryLib.sol";
 import "../libraries/LogExpMath.sol";
 import "../libraries/DSMath.sol";
 import "../libraries/SignedSafeMath.sol";
+
+import "../interfaces/wombat/IWombatVoter.sol";
+import "../interfaces/wombat/IWombatBribe.sol";
+import "../interfaces/IWBNB.sol";
 
 contract WombatStaking is Initializable, OwnableUpgradeable, ReentrancyGuardUpgradeable, PausableUpgradeable {
     using SafeERC20 for IERC20;
@@ -64,7 +70,6 @@ contract WombatStaking is Initializable, OwnableUpgradeable, ReentrancyGuardUpgr
     uint256 constant DENOMINATOR = 10000;
     uint256 public totalFee;
 
-    //
     uint256 public lockDays;
 
     mapping(address => Pool) public pools;
@@ -74,6 +79,19 @@ contract WombatStaking is Initializable, OwnableUpgradeable, ReentrancyGuardUpgr
 
     Fees[] public feeInfos;
 
+    /* ==== variable added for first upgrade === */
+
+    mapping(address => bool) public isPoolFeeFree;
+    // for bribe
+    address public smartWomConverter;
+    IWombatVoter public voter;
+    address public bribeManager;
+    uint256 public bribeCallerFee;
+    uint256 public bribeProtocolFee;
+    address public bribeFeeCollector;
+
+    address public constant wbnb = 0xbb4CdB9CBd36B01bD1cBaEBF2De08d9173bc095c;
+
     /* ============ Events ============ */
 
     // Admin
@@ -82,13 +100,15 @@ contract WombatStaking is Initializable, OwnableUpgradeable, ReentrancyGuardUpgr
     event PoolHelperUpdated(address _lpToken);
     event MasterMagpieUpdated(address _oldMasterMagpie, address _newMasterMagpie);
     event MasterWombatUpdated(address _oldWombatStaking, address _newWombatStaking);
+    event BribeManagerUpdated(address _oldBribeManager, address _bribeManager);
+    event SmartWomConverterUpdated(address _oldSmartWomConverterUpdated, address _newSmartWomConverterUpdated);
     event SetMWom(address _oldmWom, address _newmWom);
     event SetLockDays(uint256 _oldLockDays, uint256 _newLockDays);
 
     // Fee
     event AddFee(address _to, uint256 _value, bool _isMWOM, bool _isAddress);
     event SetFee(address _to, uint256 _value);
-    event RemoveFee(address to);
+    event RemoveFee(uint256 value, address to, bool _isMWOM, bool _isAddress);
     event RewardPaidTo(address _to, address _rewardToken, uint256 _feeAmount);
 
     // Deposit Withdraw
@@ -120,12 +140,19 @@ contract WombatStaking is Initializable, OwnableUpgradeable, ReentrancyGuardUpgr
     // wom
     event WomHarvested(uint256 _amount);
 
+    // Bribe
+    event BribeSet(address _voter, address _bribeManager, uint256 _bribeCallerFee, uint256 _bribeProtocolFee, address _bribeFeeCollector);
+
     /* ============ Errors ============ */
 
     error OnlyPoolHelper();
     error OnlyActivePool();
+    error OnlyActiveFee();
     error PoolOccupied();
     error InvalidFee();
+    error OnlyBribeMamager();
+    error LengthMismatch();
+    error BonusRewardExisted();
 
     /* ============ Constructor ============ */
 
@@ -171,6 +198,9 @@ contract WombatStaking is Initializable, OwnableUpgradeable, ReentrancyGuardUpgr
         _;
     }
 
+    /// @notice payable function needed to receive BNB
+    receive() external payable {}
+
     /* ============ External Getters ============ */
 
     /// @notice get the number of veWom of this contract
@@ -178,13 +208,27 @@ contract WombatStaking is Initializable, OwnableUpgradeable, ReentrancyGuardUpgr
         return IERC20(veWom).balanceOf(address(this));
     }
 
-    function getPoolTokenList() public view returns (address[] memory ) {
-        return poolTokenList;
-    }
+    function pendingBribeCallerFee(address[] calldata pendingPools)
+        external
+        view
+        returns (IERC20[][] memory rewardTokens, uint256[][] memory callerFeeAmount)
+    {
+        // Warning: Arguments do not take into account repeated elements in the pendingPools list
+        uint256[][] memory pending = voter.pendingBribes(pendingPools, address(this));
 
-    function expectedVeWomAmount(uint256 amount, uint256 _lockDays) public pure returns (uint256) {
-        // veWOM = 0.026 * lockDays^0.5
-        return amount.wmul(26162237992630200).wmul(LogExpMath.pow(_lockDays * 1e18, 50e16));
+        rewardTokens = new IERC20[][](pending.length);
+        callerFeeAmount = new uint256[][](pending.length);
+
+        for (uint256 i; i < pending.length; i++) {
+            rewardTokens[i] = IWombatBribe(voter.infos(pendingPools[i]).bribe).rewardTokens();
+            callerFeeAmount[i] = new uint256[](pending[i].length);
+
+            for (uint256 j; j < pending[i].length; j++) {
+                if (pending[i][j] > 0) {
+                    callerFeeAmount[i][j] = (pending[i][j] * bribeCallerFee) / DENOMINATOR;
+                }
+            }
+        }
     }
 
     /* ============ External Functions ============ */
@@ -308,9 +352,70 @@ contract WombatStaking is Initializable, OwnableUpgradeable, ReentrancyGuardUpgr
     /// @notice stake all the WOM balance of the contract
     function convertAllWom() whenNotPaused external {
         this.convertWOM(IERC20(wom).balanceOf(address(this)));
-    }    
+    }
 
     /* ============ Admin Functions ============ */
+
+    /// @notice Vote on WOM gauges
+    /// @dev voting harvest the pools, even if the pool has no changing vote,
+    /// so we have to ensure that each reward token goes to the good rewarder
+    /// @dev this function can cost a lot of gas, so maybe we will not launch it at every interaction
+    function vote(
+        address[] calldata _lpVote,
+        int256[] calldata _deltas,
+        address[] calldata _rewarders,
+        address caller
+    ) external returns (IERC20[][] memory rewardTokens, uint256[][] memory callerFeeAmounts) {
+        if(msg.sender != bribeManager)
+            revert OnlyBribeMamager();
+            
+        if (_lpVote.length != _rewarders.length || _lpVote.length != _deltas.length)
+            revert LengthMismatch();
+        uint256[][] memory rewardAmounts = voter.vote(_lpVote, _deltas);
+        rewardTokens = new IERC20[][](rewardAmounts.length);
+        callerFeeAmounts = new uint256[][](rewardAmounts.length);
+
+        for (uint256 i; i < rewardAmounts.length; i++) {
+
+            address bribesContract = address(voter.infos(_lpVote[i]).bribe);
+
+            if (bribesContract != address(0)) {
+                rewardTokens[i] = IWombatBribe(bribesContract).rewardTokens();
+                callerFeeAmounts[i] = new uint256[](rewardAmounts[i].length);
+
+                for (uint256 j; j < rewardAmounts[i].length; j++) {
+                    uint256 rewardAmount = rewardAmounts[i][j];
+                    uint256 callerFeeAmount = 0;
+
+                    if (rewardAmount > 0) {
+                        // if reward token is bnb, wrap it first
+                        if (address(rewardTokens[i][j]) == address(0)) {
+                            Address.sendValue(payable(wbnb), rewardAmount);
+                            rewardTokens[i][j] = IERC20(wbnb);
+                        }
+
+                        uint256 protocolFee = (rewardAmount * bribeProtocolFee) / DENOMINATOR;
+
+                        if (protocolFee > 0) {
+                            IERC20(rewardTokens[i][j]).safeTransfer(bribeFeeCollector, protocolFee);
+                        }
+
+                        if (caller != address(0) && bribeCallerFee != 0) {
+                            callerFeeAmount = (rewardAmount * bribeCallerFee) / DENOMINATOR;
+                            IERC20(rewardTokens[i][j]).safeTransfer(bribeManager, callerFeeAmount);
+                        }
+
+                        rewardAmount -= protocolFee;
+                        rewardAmount -= callerFeeAmount;
+                        IERC20(rewardTokens[i][j]).safeApprove(_rewarders[i], rewardAmount);
+                        IBaseRewardPool(_rewarders[i]).queueNewRewards(rewardAmount, address(rewardTokens[i][j]));
+                    }
+
+                    callerFeeAmounts[i][j] = callerFeeAmount;
+                }
+            }
+        }
+    }
 
     /// @notice Register a new Pool on Wombat Staking and Master Magpie
     /// @dev this function will deploy a new WombatPoolHelper, and add the Pool to the masterMagpie
@@ -435,6 +540,20 @@ contract WombatStaking is Initializable, OwnableUpgradeable, ReentrancyGuardUpgr
         emit MasterWombatUpdated(oldMasterWombat, masterWombat);
     }
 
+    function setBribeManager(address _bribeManager) external onlyOwner {
+        address oldBribeManager = bribeManager;
+        bribeManager = _bribeManager;
+
+        emit BribeManagerUpdated(oldBribeManager, bribeManager);
+    }
+
+    function setSmartConvert(address _smartConvert) external onlyOwner {
+        address oldsmartWomConverter = smartWomConverter;
+        smartWomConverter = _smartConvert;
+
+        emit SmartWomConverterUpdated(oldsmartWomConverter, smartWomConverter);
+    }
+
     function unlockAllVeWom() external whenPaused onlyOwner  {
         IVeWom.Breeding[] memory breedings = IVeWom(veWom).getUserInfo(address(this));
         for (uint256 i = 0; i < breedings.length; i++) {
@@ -471,6 +590,9 @@ contract WombatStaking is Initializable, OwnableUpgradeable, ReentrancyGuardUpgr
         bool isMWOM,
         bool _isAddress
     ) external onlyOwner {
+        if (_value >= DENOMINATOR)
+            revert InvalidFee();
+
         feeInfos.push(
             Fees({
                 value: _value,
@@ -482,9 +604,6 @@ contract WombatStaking is Initializable, OwnableUpgradeable, ReentrancyGuardUpgr
         );
         totalFee += _value;
 
-        if (totalFee >= DENOMINATOR)
-            revert InvalidFee();
-
         emit AddFee(_to, _value, isMWOM, _isAddress);
     }
 
@@ -493,14 +612,19 @@ contract WombatStaking is Initializable, OwnableUpgradeable, ReentrancyGuardUpgr
     /// @dev the value must match the max fee requirements
     /// @param _index the index of the fee in the fee list
     /// @param _value the new value of the fee
-    function setFee(uint256 _index, uint256 _value) external onlyOwner {
+    function setFee(uint256 _index, uint256 _value, address _to,
+        bool _isMWOM, bool _isAddress, bool _isActive) external onlyOwner {
+        if (_value >= DENOMINATOR)
+            revert InvalidFee();        
+
         Fees storage fee = feeInfos[_index];
-        require(fee.isActive, "Cannot change an deactivated fee");
+        fee.to = _to;
+        fee.isMWOM = _isMWOM;
+        fee.isAddress = _isAddress;
+        fee.isActive = _isActive;
+
         totalFee = totalFee - fee.value + _value;
         fee.value = _value;
-
-        if (totalFee >= DENOMINATOR)
-            revert InvalidFee();
 
         emit SetFee(fee.to, _value);
     }
@@ -508,19 +632,53 @@ contract WombatStaking is Initializable, OwnableUpgradeable, ReentrancyGuardUpgr
     /// @notice remove some fee
     /// @param _index the index of the fee in the fee list
     function removeFee(uint256 _index) external onlyOwner {
-        Fees storage fee = feeInfos[_index];
-        totalFee -= fee.value;
-        fee.isActive = false;
+        Fees memory feeToRemove = feeInfos[_index];
 
-        emit RemoveFee(fee.to);
+        for (uint i = _index; i < feeInfos.length - 1; i++) {
+           feeInfos[i] = feeInfos[i+1];
+        }
+        feeInfos.pop();
+        totalFee -= feeToRemove.value;
+
+        emit RemoveFee(feeToRemove.value, feeToRemove.to, feeToRemove.isMWOM, feeToRemove.isAddress);
     }
 
     /// @notice to add bonus token claim from wombat
     function addBonusRewardForAsset(address _lpToken, address _bonusToken) external onlyOwner {
+        uint256 length = assetToBonusRewards[_lpToken].length;
+        for (uint256 i = 0; i < length; i++) {
+            if (assetToBonusRewards[_lpToken][i] == _bonusToken)
+                revert BonusRewardExisted();
+        }
+
         assetToBonusRewards[_lpToken].push(_bonusToken);
     }
 
+    function setPoolRewardFeeFree(address _lpToken, bool isFeeFree) external onlyOwner {
+        isPoolFeeFree[_lpToken] = isFeeFree;
+    }
+    
+    function setBribe(
+        address _voter,
+        address _bribeManager,
+        uint256 _bribeCallerFee,
+        uint256 _bribeProtocolFee,
+        address _bribeFeeCollector
+    ) external onlyOwner {
+        if ((_bribeCallerFee + _bribeProtocolFee) > DENOMINATOR)
+            revert InvalidFee();
+
+        voter = IWombatVoter(_voter);
+        bribeManager = _bribeManager;
+        bribeCallerFee = _bribeCallerFee;
+        bribeProtocolFee = _bribeProtocolFee;
+        bribeFeeCollector = _bribeFeeCollector;
+
+        emit BribeSet(_voter, _bribeManager, _bribeCallerFee, _bribeProtocolFee, _bribeFeeCollector);
+    }
+
     /* ============ Internal Functions ============ */
+
     function _toMasterWomAndSendReward(address _lpToken, uint256 lpAmount, bool _isStake) internal {
         Pool storage poolInfo = pools[_lpToken];
 
@@ -535,12 +693,12 @@ contract WombatStaking is Initializable, OwnableUpgradeable, ReentrancyGuardUpgr
         else
             IMasterWombat(masterWombat).withdraw(poolInfo.pid, lpAmount); // triggers harvest from wombat exchange
         uint256 womRewards = IERC20(wom).balanceOf(address(this)) - womBeforeBalance;
-        _sendRewards(wom, poolInfo.rewarder, womRewards);
+        _sendRewards(_lpToken, wom, poolInfo.rewarder, womRewards);
 
         for (uint256 i; i < bonusTokensLength; i++) {
             uint256 bonusBalanceDiff = IERC20(bonusTokens[i]).balanceOf(address(this)) - beforeBalances[i];
             if (bonusBalanceDiff > 0) {
-                _sendRewards(bonusTokens[i], poolInfo.rewarder, bonusBalanceDiff);
+                _sendRewards(_lpToken, bonusTokens[i], poolInfo.rewarder, bonusBalanceDiff);
             }
         }
 
@@ -571,38 +729,44 @@ contract WombatStaking is Initializable, OwnableUpgradeable, ReentrancyGuardUpgr
     /// @param _amount the initial amount of rewards after harvest
 
     function _sendRewards(
+        address _lpToken,
         address _rewardToken,
         address _rewarder,
         uint256 _amount
     ) internal {
+        if (_amount == 0) return;
         uint256 originalRewardAmount = _amount;
-        for (uint256 i = 0; i < feeInfos.length; i++) {
-            Fees storage feeInfo = feeInfos[i];
 
-            if (feeInfo.isActive) {
-                address rewardToken = _rewardToken;
-                uint256 feeAmount = (originalRewardAmount * feeInfo.value) / DENOMINATOR;
-                _amount -= feeAmount;
-                uint256 feeTosend = feeAmount;
+        if (!isPoolFeeFree[_lpToken]) {
+            for (uint256 i = 0; i < feeInfos.length; i++) {
+                Fees storage feeInfo = feeInfos[i];
 
-                if (feeInfo.isMWOM && rewardToken == wom) {
-                    IERC20(wom).safeApprove(mWom, feeAmount);
-                    uint256 beforeBalnce = IMWom(mWom).balanceOf(address(this));
-                    IMWom(mWom).convert(feeAmount);
-                    rewardToken = mWom;
-                    feeTosend = IMWom(mWom).balanceOf(address(this)) - beforeBalnce;
-                }
+                if (feeInfo.isActive) {
+                    address rewardToken = _rewardToken;
+                    uint256 feeAmount = (originalRewardAmount * feeInfo.value) / DENOMINATOR;
+                    _amount -= feeAmount;
+                    uint256 feeTosend = feeAmount;
 
-                if (!feeInfo.isAddress) {
-                    IERC20(rewardToken).safeApprove(feeInfo.to, 0);
-                    IERC20(rewardToken).safeApprove(feeInfo.to, feeTosend);
-                    IBaseRewardPool(feeInfo.to).queueNewRewards(feeTosend, rewardToken);
-                } else {
-                    IERC20(rewardToken).safeTransfer(feeInfo.to, feeTosend);
-                    emit RewardPaidTo(feeInfo.to, rewardToken, feeTosend);
+                    if (feeInfo.isMWOM && rewardToken == wom) {
+                        IERC20(wom).safeApprove(smartWomConverter, feeAmount);
+                        uint256 beforeBalnce = IMWom(mWom).balanceOf(address(this));
+                        IConverter(smartWomConverter).smartConvert(feeAmount, false);
+                        rewardToken = mWom;
+                        feeTosend = IMWom(mWom).balanceOf(address(this)) - beforeBalnce;
+                    }
+
+                    if (!feeInfo.isAddress) {
+                        IERC20(rewardToken).safeApprove(feeInfo.to, 0);
+                        IERC20(rewardToken).safeApprove(feeInfo.to, feeTosend);
+                        IBaseRewardPool(feeInfo.to).queueNewRewards(feeTosend, rewardToken);
+                    } else {
+                        IERC20(rewardToken).safeTransfer(feeInfo.to, feeTosend);
+                        emit RewardPaidTo(feeInfo.to, rewardToken, feeTosend);
+                    }
                 }
             }
         }
+
         IERC20(_rewardToken).safeApprove(_rewarder, 0);
         IERC20(_rewardToken).safeApprove(_rewarder, _amount);
         IBaseRewardPool(_rewarder).queueNewRewards(_amount, _rewardToken);

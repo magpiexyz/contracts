@@ -8,9 +8,11 @@ import { OwnableUpgradeable } from "@openzeppelin/contracts-upgradeable/access/O
 import { Initializable } from "@openzeppelin/contracts-upgradeable/proxy/utils/Initializable.sol";
 import { ReentrancyGuardUpgradeable } from '@openzeppelin/contracts-upgradeable/security/ReentrancyGuardUpgradeable.sol';
 import { PausableUpgradeable } from '@openzeppelin/contracts-upgradeable/security/PausableUpgradeable.sol';
+import { Address } from "@openzeppelin/contracts/utils/Address.sol";
 
 import "../interfaces/wombat/IWombatStaking.sol";
 import "../interfaces/ISimpleHelper.sol";
+import "../interfaces/IVLMGP.sol";
 
 /// @title mWOM
 /// @author Magpie Team
@@ -26,7 +28,14 @@ contract mWOM is Initializable, ERC20Upgradeable, OwnableUpgradeable, Reentrancy
     uint256 public totalConverted;
     uint256 public totalAccumulated;
 
-    bool    public isWomUp;
+    bool    public isWomUp; // not in used anymore, but since upgradable, we should still leave it here
+
+    /* ==== variable added for first upgrade === */
+
+    uint256 public constant DENOMINATOR = 10000;
+    uint256 public rewardRatio;
+    address public vlMGP;
+    address public mgp;
 
     /* ============ Events ============ */
 
@@ -35,12 +44,15 @@ contract mWOM is Initializable, ERC20Upgradeable, OwnableUpgradeable, Reentrancy
     event WombatStakingSet(address indexed _wombatStaking);
     event WomConverted(uint256 _womAmount, uint256 _veWomAmount);
     event WomUpSet(bool _isWomUp);
+    event VlmgpRewarded(address indexed _beneficiary, uint256 _amount);
+    event MPGDustTransfered(address _to, uint256 _amount);
 
     /* ============ Errors ============ */
 
     error HelperNotSet();
     error WombatStakingNotSet();
-    error OnlyWomUp();
+    error MustBeContract();
+    error NoIncentive();
 
     /* ============ Constructor ============ */
 
@@ -52,7 +64,7 @@ contract mWOM is Initializable, ERC20Upgradeable, OwnableUpgradeable, Reentrancy
         totalConverted = 0;
         totalAccumulated = 0;
 
-        isWomUp = true; // when deployed, it should be during Wom Up campaign.
+        isWomUp = true; // not in used anymore
     }
 
     /* ============ External Functions ============ */
@@ -68,10 +80,18 @@ contract mWOM is Initializable, ERC20Upgradeable, OwnableUpgradeable, Reentrancy
     }
 
     function deposit(uint256 _amount) whenNotPaused external {
-        if(!isWomUp)
-            revert OnlyWomUp();
-
         _convert(_amount, false, false);
+    }
+
+    // if reward ratio is turned on, reward wom converter with vlMGP with the ratio, the ratio can be more than 100%
+    function incentiveDeposit(uint256 _amount, bool _stake) whenNotPaused external {
+        if (rewardRatio == 0) revert NoIncentive();
+
+        _convert(_amount, _stake, false);
+        uint256 vlMGPAmount = _amount * rewardRatio / DENOMINATOR;
+        IERC20(mgp).safeApprove(address(vlMGP), vlMGPAmount);
+        IVLMGP(vlMGP).lockFor(vlMGPAmount, msg.sender);
+        emit VlmgpRewarded(msg.sender, vlMGPAmount);
     }
 
     /* ============ Internal Functions ============ */
@@ -143,5 +163,24 @@ contract mWOM is Initializable, ERC20Upgradeable, OwnableUpgradeable, Reentrancy
     function lockAllWom() external onlyOwner {
         uint256 allWom = IERC20(wom).balanceOf(address(this));
         _lockWom(allWom, true);
+    }
+
+    function setRewardRatio(uint256 _rewardRatio) external onlyOwner {
+        rewardRatio = _rewardRatio;
+    }
+
+    function setVlmgp(address _vlMGP) external onlyOwner {
+        if (!Address.isContract(address(_vlMGP)))
+            revert MustBeContract();
+
+        vlMGP = _vlMGP;
+        mgp = address(IVLMGP(vlMGP).MGP());
+    }
+
+    function transferMGPDust() external onlyOwner {
+        uint256 dust = IERC20(mgp).balanceOf(address(this));
+        IERC20(mgp).transfer(owner(), dust);
+
+        emit MPGDustTransfered(owner(), dust);
     }
 }
