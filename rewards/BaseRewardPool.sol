@@ -14,11 +14,12 @@ import "../interfaces/IBaseRewardPool.sol";
 /// @notice You can use this contract for getting informations about rewards for a specific pools
 contract BaseRewardPool is Ownable, IBaseRewardPool {
     using SafeERC20 for IERC20Metadata;
+    using SafeERC20 for IERC20;
 
     /* ============ State Variables ============ */
 
     address public immutable stakingToken;
-    address public immutable masterMagpie;          // master magpie
+    address public immutable operator;          // master magpie
 
     address[] public rewardTokens;
 
@@ -49,6 +50,7 @@ contract BaseRewardPool is Ownable, IBaseRewardPool {
     error OnlyManager();
     error OnlyMasterMagpie();
     error NotAllowZeroAddress();
+    error MustBeRewardToken();
 
     /* ============ Constructor ============ */
 
@@ -65,7 +67,7 @@ contract BaseRewardPool is Ownable, IBaseRewardPool {
         ) revert NotAllowZeroAddress();
 
         stakingToken = _stakingToken;
-        masterMagpie = _masterMagpie;
+        operator = _masterMagpie;
 
         if (_rewardToken != address(0)) {
             rewards[_rewardToken] = Reward({
@@ -84,17 +86,10 @@ contract BaseRewardPool is Ownable, IBaseRewardPool {
     /* ============ Modifiers ============ */
 
     modifier updateReward(address _account) {
-        uint256 rewardTokensLength = rewardTokens.length;
-        for (uint256 index = 0; index < rewardTokensLength; ++index) {
-            address rewardToken = rewardTokens[index];
-            userRewards[rewardToken][_account] = earned(_account, rewardToken);
-            userRewardPerTokenPaid[rewardToken][_account] = rewardPerToken(
-                rewardToken
-            );
-        }
+        _updateFor(_account);
         _;
     }
-    
+
     modifier onlyManager() {
         if (!managers[msg.sender])
             revert OnlyManager();
@@ -102,7 +97,7 @@ contract BaseRewardPool is Ownable, IBaseRewardPool {
     }
 
     modifier onlyMasterMagpie() {
-        if (msg.sender != masterMagpie)
+        if (msg.sender != operator)
             revert OnlyMasterMagpie();
         _;
     }
@@ -113,18 +108,11 @@ contract BaseRewardPool is Ownable, IBaseRewardPool {
     /// @param _rewardToken Address of reward token
     /// @return Returns decimals of reward token
     function rewardDecimals(address _rewardToken)
-        override
         public
         view
         returns (uint256)
     {
         return IERC20Metadata(_rewardToken).decimals();
-    }
-
-    /// @notice Returns address of staking token
-    /// @return address of staking token
-    function getStakingToken() external override view returns (address) {
-        return stakingToken;
     }
 
     /// @notice Returns decimals of staking token
@@ -136,14 +124,14 @@ contract BaseRewardPool is Ownable, IBaseRewardPool {
     /// @notice Returns current amount of staked tokens
     /// @return Returns current amount of staked tokens
     function totalStaked() external override virtual view returns (uint256) {
-        return IERC20(stakingToken).balanceOf(masterMagpie);
+        return IERC20(stakingToken).balanceOf(operator);
     }
 
     /// @notice Returns amount of staked tokens in master magpie by account
     /// @param _account Address account
     /// @return Returns amount of staked tokens by account
-    function balanceOf(address _account) external override virtual view returns (uint256) {
-        (uint256 staked, ) =  IMasterMagpie(masterMagpie).stakingInfo(stakingToken, _account);
+    function balanceOf(address _account) public override virtual view returns (uint256) {
+        (uint256 staked, ) =  IMasterMagpie(operator).stakingInfo(stakingToken, _account);
         return staked;
     }
 
@@ -178,21 +166,6 @@ contract BaseRewardPool is Ownable, IBaseRewardPool {
         }
     }
 
-    /* ============ External Functions ============ */
-
-    /// @notice Updates the reward information for one account
-    /// @param _account Address account
-    function updateFor(address _account) external override {
-        uint256 length = rewardTokens.length;
-        for (uint256 index = 0; index < length; ++index) {
-            address rewardToken = rewardTokens[index];
-            userRewards[rewardToken][_account] = earned(_account, rewardToken);
-            userRewardPerTokenPaid[rewardToken][_account] = rewardPerToken(
-                rewardToken
-            );
-        }
-    }
-
     /// @notice Returns amount of reward token earned by a user
     /// @param _account Address account
     /// @param _rewardToken Address reward token
@@ -204,7 +177,7 @@ contract BaseRewardPool is Ownable, IBaseRewardPool {
         returns (uint256)
     {
         return (
-            (((this.balanceOf(_account) *
+            (((balanceOf(_account) *
                 (rewardPerToken(_rewardToken) -
                     userRewardPerTokenPaid[_rewardToken][_account])) /
                 (10**stakingDecimals())) + userRewards[_rewardToken][_account])
@@ -231,9 +204,20 @@ contract BaseRewardPool is Ownable, IBaseRewardPool {
         return pendingBonusRewards;
     }
 
+    function getStakingToken() external view returns (address) {
+        return stakingToken;
+    }
+
+    /* ============ External Functions ============ */
+
+    /// @notice Updates the reward information for one account
+    /// @param _account Address account
+    function updateFor(address _account) override external {
+        _updateFor(_account);
+    }
+
     /// @notice Calculates and sends reward to user. Only callable by masterMagpie
     /// @param _account Address account
-    /// @return Returns True
     function getReward(address _account, address _receiver)
         override
         public
@@ -247,11 +231,16 @@ contract BaseRewardPool is Ownable, IBaseRewardPool {
             uint256 reward = userRewards[rewardToken][_account]; // updated during updateReward modifier
             if (reward > 0) {
                 userRewards[rewardToken][_account] = 0;
-                IERC20Metadata(rewardToken).safeTransfer(_receiver, reward);
+                IERC20(rewardToken).safeTransfer(_receiver, reward);
                 emit RewardPaid(_account, _receiver, reward, rewardToken);
             }
         }
+
         return true;
+    }
+
+    function getRewards(address _account, address _receiver, address[] memory _rewardTokens) override external {
+
     }
 
     function getRewardLength() external view returns(uint256) {
@@ -269,7 +258,6 @@ contract BaseRewardPool is Ownable, IBaseRewardPool {
     /// @notice Sends new rewards to be distributed to the users staking. Only callable by manager
     /// @param _amountReward Amount of reward token to be distributed
     /// @param _rewardToken Address reward token
-    /// @return Returns True
     function queueNewRewards(uint256 _amountReward, address _rewardToken)
         override
         external
@@ -280,7 +268,34 @@ contract BaseRewardPool is Ownable, IBaseRewardPool {
             rewardTokens.push(_rewardToken);
             isRewardToken[_rewardToken] = true;
         }
-        IERC20Metadata(_rewardToken).safeTransferFrom(
+
+        _provisionReward(_amountReward, _rewardToken);
+        return true;
+    }
+
+    /// @notice Sends new rewards to be distributed to the users staking. Only possible to donate already registered token
+    /// @param _amountReward Amount of reward token to be distributed
+    /// @param _rewardToken Address reward token
+    function donateRewards(uint256 _amountReward, address _rewardToken) external {
+        if (!isRewardToken[_rewardToken])
+            revert MustBeRewardToken();
+
+        _provisionReward(_amountReward, _rewardToken);
+    }
+
+    /* ============ Internal Functions ============ */
+
+    function _updateFor(address _account) internal {
+        uint256 length = rewardTokens.length;
+        for (uint256 index = 0; index < length; ++index) {
+            address rewardToken = rewardTokens[index];
+            userRewards[rewardToken][_account] = earned(_account, rewardToken);
+            userRewardPerTokenPaid[rewardToken][_account] = rewardPerToken(rewardToken);
+        }
+    }
+
+    function _provisionReward(uint256 _amountReward, address _rewardToken) internal {
+        IERC20(_rewardToken).safeTransferFrom(
             msg.sender,
             address(this),
             _amountReward
@@ -302,6 +317,5 @@ contract BaseRewardPool is Ownable, IBaseRewardPool {
                 this.totalStaked();
         }
         emit RewardAdded(_amountReward, _rewardToken);
-        return true;
     }
 }

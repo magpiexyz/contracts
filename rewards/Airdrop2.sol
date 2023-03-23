@@ -60,17 +60,8 @@ contract Airdrop2 is Ownable, Pausable, ReentrancyGuard {
             return 0;
         }
 
-        uint256 claimed = getClaimed(account);
-        if (claimed >= totalAmount) {
-            return 0;
-        }
-
-        uint256 vested = (totalAmount * 5 / 100) + (totalAmount * 95 / 100) * ((block.timestamp - startVestingTime) / intervals) / (vestingPeriodCount);
-        if (vested > totalAmount) {
-            return totalAmount - claimed;
-        }
-
-        return vested - claimed;
+        uint256 claimable =  _getClaimable(account, totalAmount);
+        return claimable;
     }
 
     /* ============ External Functions ============ */
@@ -90,7 +81,7 @@ contract Airdrop2 is Ownable, Pausable, ReentrancyGuard {
         //Verify the merkle proof.
         require(verifyProof(msg.sender, totalAmount, merkleProof), "Airdrop2: Invalid proof.");
 
-        uint256 claimable = getClaimable(msg.sender, totalAmount, merkleProof);
+        uint256 claimable = _getClaimable(msg.sender, totalAmount);
 
         // Mark it claimed and send the token.
         if (isLock) {
@@ -102,6 +93,22 @@ contract Airdrop2 is Ownable, Pausable, ReentrancyGuard {
         uint256 userClaimedAmount = claimedAmount[msg.sender];
         claimedAmount[msg.sender] = userClaimedAmount + claimable;
         emit ClaimEvent(msg.sender, claimable, isLock);
+    }
+
+    /* ============ Internal Functions ============ */
+
+    function _getClaimable(address account, uint256 totalAmount) internal view returns (uint256) {
+        uint256 claimed = getClaimed(account);
+        if (claimed >= totalAmount) {
+            return 0;
+        }
+
+        uint256 vested = (totalAmount * 5 / 100) + (totalAmount * 95 / 100) * ((block.timestamp - startVestingTime) / intervals) / (vestingPeriodCount);
+        if (vested > totalAmount) {
+            return totalAmount - claimed;
+        }
+
+        return vested - claimed;
     }
 
     /* ============ Admin functions ============ */

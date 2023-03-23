@@ -11,12 +11,13 @@ import { ReentrancyGuardUpgradeable } from '@openzeppelin/contracts-upgradeable/
 import { PausableUpgradeable } from '@openzeppelin/contracts-upgradeable/security/PausableUpgradeable.sol';
 
 import "../Mgp.sol";
-import "./BaseRewardPool.sol";
+import "./BaseRewardPoolV2.sol";
 import "../interfaces/IBaseRewardPool.sol";
 import "../interfaces/IvlmgpPBaseRewarder.sol";
 import "../interfaces/IHarvesttablePoolHelper.sol";
 import "../interfaces/IVLMGP.sol";
 import "../interfaces/ILocker.sol";
+import "../interfaces/IReferralStorage.sol";
 
 // MasterMagpie is a boss. He says "go f your blocks lego boy, I'm gonna use timestamp instead".
 // And to top it off, it takes no risks. Because the biggest risk is operator error.
@@ -96,6 +97,15 @@ contract MasterMagpie is Initializable, OwnableUpgradeable, ReentrancyGuardUpgra
 
     mapping(address => bool) public MPGRewardPool; // pools that emit MGP otherwise, vlMGP
 
+    /* ==== variable added for second upgrade === */
+
+    mapping(address => mapping (address => uint256)) public unClaimedMgp; // unclaimed mgp reward before lastRewardTimestamp
+    mapping(address => address) public legacyRewarder; // old rewarder
+
+    /* ==== variable added for third upgrade === */
+
+    address public referral;
+
     /* ============ Events ============ */
 
     event Add(
@@ -136,6 +146,7 @@ contract MasterMagpie is Initializable, OwnableUpgradeable, ReentrancyGuardUpgra
         uint256 _amount
     );
     event UpdateEmissionRate(address indexed _user, uint256 _oldMgpPerSec, uint256 _newMgpPerSec);
+    event UpdatePoolAlloc(address _stakingToken, uint256 _oldAllocPoint, uint256 _newAllocPoint);
     event PoolManagerStatus(address _account, bool _status);
     event CompounderUpated(address _newCompounder, address _oldCompounder);
     event VLMGPUpdated(address _newVlmgp, address _oldVlmgp);
@@ -157,6 +168,7 @@ contract MasterMagpie is Initializable, OwnableUpgradeable, ReentrancyGuardUpgra
     error OnlyVlMgp();
     error MGPsetAlready();
     error MustBeContract();
+    error LengthMismatch();
 
     /* ============ Constructor ============ */    
 
@@ -183,9 +195,7 @@ contract MasterMagpie is Initializable, OwnableUpgradeable, ReentrancyGuardUpgra
     }
 
     modifier _onlyPoolHelper(address _stakedToken) {
-        PoolInfo storage pool = tokenToPoolInfo[_stakedToken];
-
-        if (msg.sender != pool.helper)
+        if (msg.sender != tokenToPoolInfo[_stakedToken].helper)
             revert OnlyPoolHelper();
         _;            
     }
@@ -228,7 +238,7 @@ contract MasterMagpie is Initializable, OwnableUpgradeable, ReentrancyGuardUpgra
         return (
             (mgpPerSec * pool.allocPoint / totalAllocPoint),
             pool.allocPoint,
-            IERC20(_stakingToken).balanceOf(address(this)),
+            _calLpSupply(_stakingToken),
             totalAllocPoint
         );
     }
@@ -280,13 +290,8 @@ contract MasterMagpie is Initializable, OwnableUpgradeable, ReentrancyGuardUpgra
         }
     }
 
-    function allPendingTokens(
-        address _stakingToken,
-        address _user
-    )
-        external
-        view
-        returns (
+    function allPendingTokens(address _stakingToken, address _user)
+        external view returns (
             uint256 pendingMGP,
             address[] memory bonusTokenAddresses,
             string[] memory bonusTokenSymbols,
@@ -315,11 +320,12 @@ contract MasterMagpie is Initializable, OwnableUpgradeable, ReentrancyGuardUpgra
     }
 
     /* ============ External Functions ============ */
+
     /// @notice Deposits staking token to the pool, updates pool and distributes rewards
     /// @param _stakingToken Staking token of the pool
     /// @param _amount Amount to deposit to the pool
     function deposit(address _stakingToken, uint256 _amount) external whenNotPaused nonReentrant {
-        _deposit(_stakingToken, msg.sender, _amount, true);
+        _deposit(_stakingToken, msg.sender, _amount, false);
     }
 
     /// @notice Withdraw staking tokens from Master Mgapie.
@@ -338,7 +344,7 @@ contract MasterMagpie is Initializable, OwnableUpgradeable, ReentrancyGuardUpgra
         uint256 _amount,
         address _for
     ) external whenNotPaused _onlyPoolHelper(_stakingToken) nonReentrant {
-        _deposit(_stakingToken, _for, _amount, true);
+        _deposit(_stakingToken, _for, _amount, false);
     }
 
     /// @notice Withdraw staking tokens from Mastser Magpie for a specific user. Can only be called by pool helper
@@ -360,14 +366,13 @@ contract MasterMagpie is Initializable, OwnableUpgradeable, ReentrancyGuardUpgra
         if (block.timestamp <= pool.lastRewardTimestamp || totalAllocPoint == 0) {
             return;
         }
-        uint256 lpSupply = IERC20(pool.stakingToken).balanceOf(address(this));
+        uint256 lpSupply = _calLpSupply(_stakingToken);
         if (lpSupply == 0) {
             pool.lastRewardTimestamp = block.timestamp;
             return;
         }        
         uint256 multiplier = block.timestamp - pool.lastRewardTimestamp;
-        uint256 mgpReward = (multiplier * mgpPerSec * pool.allocPoint) /
-            totalAllocPoint;
+        uint256 mgpReward = (multiplier * mgpPerSec * pool.allocPoint) / totalAllocPoint;
         
         pool.accMGPPerShare = pool.accMGPPerShare + ((mgpReward * 1e12) / lpSupply);
         pool.lastRewardTimestamp = block.timestamp;
@@ -382,27 +387,38 @@ contract MasterMagpie is Initializable, OwnableUpgradeable, ReentrancyGuardUpgra
 
     /// @notice Update reward variables for all pools. Be mindful of gas costs!
     function massUpdatePools() public whenNotPaused {
-        uint256 length = registeredToken.length;
-        for (uint256 pid = 0; pid < length; ++pid) {
+        for (uint256 pid = 0; pid < registeredToken.length; ++pid) {
             updatePool(registeredToken[pid]);
         }
     }
 
-    /// @notice Claims for each of the pools in the list
-    /// @param _stakingTokens Staking tokens of the pools we want to claim from
+    /// @notice Claims for each of the pools with specified rewards to claim for each pool
+    function multiclaimSpec(address[] calldata _stakingTokens, address[][] memory _rewardTokens)
+        external whenNotPaused
+    {
+        _multiClaim(_stakingTokens, msg.sender, msg.sender, _rewardTokens);
+    }
+
+    /// @notice Claims for each of the pools with specified rewards to claim for each pool
+    function multiclaimFor(address[] calldata _stakingTokens, address[][] memory _rewardTokens, address _account)
+        external whenNotPaused
+    {
+        _multiClaim(_stakingTokens, _account, _account, _rewardTokens);
+    }
+
+    /// @notice Claims for each of the pools with specified rewards to claim for each pool. ONLY callable by compounder!!!!!!
+    function multiclaimOnBehalf(address[] calldata _stakingTokens, address[][] memory _rewardTokens, address _account)
+        external whenNotPaused _onlyCompounder
+    {
+        _multiClaim(_stakingTokens, _account, msg.sender, _rewardTokens);
+    }
+
+    /// @notice Claim for all rewards for the pools
     function multiclaim(address[] calldata _stakingTokens)
         external whenNotPaused
     {
-        _multiClaim(_stakingTokens, msg.sender, msg.sender);
-    }
-
-    /// @notice Claims for each of the pools. ONLY callable by compounder!!!!!!
-    /// @param _stakingTokens Staking tokens of the pools we want to claim from
-    /// @param _account address of user's reward
-    function multiclaimOnBehalf(address[] calldata _stakingTokens, address _account)
-        external whenNotPaused _onlyCompounder
-    {
-        _multiClaim(_stakingTokens, _account, msg.sender);
+        address[][] memory rewardTokens = new address[][](_stakingTokens.length);
+        _multiClaim(_stakingTokens, msg.sender, msg.sender, rewardTokens);
     }
 
     /// @notice Withdraw all available tokens without caring about rewards. EMERGENCY ONLY. 
@@ -412,11 +428,11 @@ contract MasterMagpie is Initializable, OwnableUpgradeable, ReentrancyGuardUpgra
     function emergencyWithdraw(address _stakingToken) external whenPaused {
         PoolInfo storage pool = tokenToPoolInfo[_stakingToken];
         UserInfo storage user = userInfo[_stakingToken][msg.sender];
-        uint256 availableaAount = user.available;
+        uint256 availableaAmount = user.available;
         user.available = 0;
-        IERC20(pool.stakingToken).safeTransfer(address(msg.sender), availableaAount);
-        emit EmergencyWithdraw(msg.sender, _stakingToken, availableaAount);
-        user.amount = user.amount - availableaAount;
+        IERC20(pool.stakingToken).safeTransfer(address(msg.sender), availableaAmount);
+        emit EmergencyWithdraw(msg.sender, _stakingToken, availableaAmount);
+        user.amount = user.amount - availableaAmount;
         user.rewardDebt = (user.amount * pool.accMGPPerShare) / 1e12;
     }
 
@@ -426,7 +442,7 @@ contract MasterMagpie is Initializable, OwnableUpgradeable, ReentrancyGuardUpgra
         uint256 _amount,
         address _for
     ) external whenNotPaused _onlyVlMgp() {
-        _deposit(address(vlmgp), _for, _amount, false);
+        _deposit(address(vlmgp), _for, _amount, true);
     }
     
     function withdrawVlMGPFor(
@@ -439,25 +455,26 @@ contract MasterMagpie is Initializable, OwnableUpgradeable, ReentrancyGuardUpgra
     /* ============ Internal Functions ============ */
 
     /// @notice internal function to deal with deposit staking token
-    function _deposit(address _stakingToken, address _account, uint256 _amount, bool _isAvailable) internal {
+    function _deposit(address _stakingToken, address _account, uint256 _amount, bool _isVlmgp) internal {
         updatePool(_stakingToken);
 
         PoolInfo storage pool = tokenToPoolInfo[_stakingToken];
         UserInfo storage user = userInfo[_stakingToken][_account];
 
         if (user.amount > 0) {
-            _harvestMGP(_stakingToken, _account, _account);
+            _harvestMGP(_stakingToken, _account);
         }
-        _harvestBaseRewarder(_stakingToken, _account, _account);
-        IERC20(pool.stakingToken).safeTransferFrom(address(msg.sender), address(this), _amount);
+        _harvestBaseRewarder(_stakingToken, _account);
 
         user.amount = user.amount + _amount;
-        if (_isAvailable)
+        if (!_isVlmgp) {
             user.available = user.available + _amount;
+            IERC20(pool.stakingToken).safeTransferFrom(address(msg.sender), address(this), _amount);
+        }
         user.rewardDebt = (user.amount * pool.accMGPPerShare) / 1e12;
 
         if (_amount > 0)
-            if (_isAvailable)
+            if (!_isVlmgp)
                 emit Deposit(_account, _stakingToken, _amount);
             else
                 emit DepositNotAvailable(_account, _stakingToken, _amount);
@@ -466,58 +483,58 @@ contract MasterMagpie is Initializable, OwnableUpgradeable, ReentrancyGuardUpgra
     /// @notice internal function to deal with withdraw staking token
     function _withdraw(address _stakingToken, address _account, uint256 _amount, bool _isVlMgp) internal {
         _harvestAndUnstake(_stakingToken, _account, _amount, _isVlMgp);
-        PoolInfo storage pool = tokenToPoolInfo[_stakingToken];
 
-        IERC20(pool.stakingToken).safeTransfer(address(msg.sender), _amount);
+        if (!_isVlMgp)
+            IERC20(tokenToPoolInfo[_stakingToken].stakingToken).safeTransfer(address(msg.sender), _amount);
         emit Withdraw(_account, _stakingToken, _amount);
     }
 
     function _harvestAndUnstake(address _stakingToken, address _account, uint256 _amount, bool _isVlMgp) internal {
         updatePool(_stakingToken);
 
-        PoolInfo storage pool = tokenToPoolInfo[_stakingToken];
         UserInfo storage user = userInfo[_stakingToken][_account];
 
-        if (user.available < _amount && !_isVlMgp)
+        if (!_isVlMgp && user.available < _amount)
             revert WithdrawAmountExceedsStaked();
         else if(user.amount < _amount && _isVlMgp)
             revert UnlockAmountExceedsLocked();
         
-        _harvestMGP(_stakingToken, _account, _account);
-        _harvestBaseRewarder(_stakingToken, _account, _account);
+        _harvestMGP(_stakingToken, _account);
+        _harvestBaseRewarder(_stakingToken, _account);
 
         user.amount = user.amount - _amount;
         
         if(!_isVlMgp)
             user.available = user.available - _amount;
-        user.rewardDebt = (user.amount * pool.accMGPPerShare) / 1e12;
+        user.rewardDebt = (user.amount * tokenToPoolInfo[_stakingToken].accMGPPerShare) / 1e12;
     }
 
-    function _multiClaim(address[] calldata _stakingTokens, address _user, address _receiver) internal nonReentrant {
+    function _multiClaim(address[] calldata _stakingTokens, address _user, address _receiver, address[][] memory _rewardTokens) internal nonReentrant {
         uint256 length = _stakingTokens.length;
-        
-        uint256 vlMGPPoolAmount = 0;
-        uint256 mWOmPoolAmount = 0;
-        uint256 defaultPoolAmount = 0;
+        if (length != _rewardTokens.length) revert LengthMismatch();
 
-        for (uint256 pid = 0; pid < length; ++pid) {
-            address _stakingToken = _stakingTokens[pid];
-            PoolInfo storage pool = tokenToPoolInfo[_stakingToken];
+        uint256 vlMGPPoolAmount;
+        uint256 mWOmPoolAmount;
+        uint256 defaultPoolAmount;
+
+        for (uint256 i = 0; i < length; ++i) {
+            address _stakingToken = _stakingTokens[i];
             UserInfo storage user = userInfo[_stakingToken][_user];
+            
             updatePool(_stakingToken);
+            uint256 claimableMgp = _calNewMGP(_stakingToken, _user) + unClaimedMgp[_stakingToken][_user];
 
-            if (user.amount > 0) {
-                if (_stakingToken == address(vlmgp)) {
-                    vlMGPPoolAmount += _calMGPPending(_stakingToken, _user);
-                } else if (MPGRewardPool[_stakingToken]) {
-                    mWOmPoolAmount += _calMGPPending(_stakingToken, _user);
-                } else {
-                    defaultPoolAmount += _calMGPPending(_stakingToken, _user);
-                }
+            if (_stakingToken == address(vlmgp)) {
+                vlMGPPoolAmount += claimableMgp;
+            } else if (MPGRewardPool[_stakingToken]) {
+                mWOmPoolAmount += claimableMgp;
+            } else {
+                defaultPoolAmount += claimableMgp;
             }
 
-            user.rewardDebt = (user.amount * pool.accMGPPerShare) / 1e12;
-            _harvestBaseRewarder(_stakingToken, _user, _receiver);
+            unClaimedMgp[_stakingToken][_user] = 0;
+            user.rewardDebt = (user.amount * tokenToPoolInfo[_stakingToken].accMGPPerShare) / 1e12;
+            _claimBaseRewarder(_stakingToken, _user, _receiver, _rewardTokens[i]);
         }
 
         if (vlMGPPoolAmount > 0) {
@@ -531,13 +548,20 @@ contract MasterMagpie is Initializable, OwnableUpgradeable, ReentrancyGuardUpgra
         if (defaultPoolAmount > 0) {
             _sendVlMGPFor(_user, _receiver, defaultPoolAmount);
         }
+
+        uint256 totalReward = vlMGPPoolAmount + mWOmPoolAmount + defaultPoolAmount;
+
+        if (totalReward > 0) {
+            IReferralStorage(referral).trigger(_user, totalReward);
+        }
     }
 
+    /// @notice calculate MGP reward based at current timestamp, for frontend only
     function _calMGPReward(address _stakingToken, address _user) internal view returns(uint256 pendingMGP) {
         PoolInfo storage pool = tokenToPoolInfo[_stakingToken];
         UserInfo storage user = userInfo[_stakingToken][_user];
         uint256 accMGPPerShare = pool.accMGPPerShare;
-        uint256 lpSupply = IERC20(pool.stakingToken).balanceOf(address(this));
+        uint256 lpSupply = _calLpSupply(_stakingToken);
 
         if (block.timestamp > pool.lastRewardTimestamp && lpSupply != 0) {
             uint256 multiplier = block.timestamp - pool.lastRewardTimestamp;
@@ -547,19 +571,21 @@ contract MasterMagpie is Initializable, OwnableUpgradeable, ReentrancyGuardUpgra
         }
 
         pendingMGP = (user.amount * accMGPPerShare) / 1e12 - user.rewardDebt;
+        pendingMGP += unClaimedMgp[_stakingToken][_user];
     }
 
     /// @notice Harvest MGP for an account
-    function _harvestMGP(address _stakingToken, address _account, address _receiver) internal {
+    /// only update the reward counting but not sending them to user
+    function _harvestMGP(address _stakingToken, address _account) internal {
         // Harvest MGP
-        uint256 pending = _calMGPPending(_stakingToken, _account);
-        _safeMGPTransfer(_stakingToken, _account, _receiver, pending);
+        uint256 pending = _calNewMGP(_stakingToken, _account);
+        unClaimedMgp[_stakingToken][_account] += pending;
     }
 
-    function _calMGPPending(address _stakingToken, address _account) view internal returns(uint256) {
-        PoolInfo storage pool = tokenToPoolInfo[_stakingToken];
-        UserInfo storage user = userInfo[_stakingToken][_account];         
-        uint256 pending = (user.amount * pool.accMGPPerShare) /
+    /// @notice calculate MGP reward based on current accMGPPerShare
+    function _calNewMGP(address _stakingToken, address _account) view internal returns(uint256) {
+        UserInfo storage user = userInfo[_stakingToken][_account];
+        uint256 pending = (user.amount * tokenToPoolInfo[_stakingToken].accMGPPerShare) /
             1e12 -
             user.rewardDebt;
         return pending;
@@ -567,30 +593,28 @@ contract MasterMagpie is Initializable, OwnableUpgradeable, ReentrancyGuardUpgra
 
     /// @notice Harvest reward token in BaseRewarder for an account. NOTE: Baserewarder use user staking token balance as source to
     /// calculate reward token amount
-    function _harvestBaseRewarder(address _stakingToken, address _account, address _receiver) internal {
+    function _claimBaseRewarder(address _stakingToken, address _account, address _receiver, address[] memory _rewardTokens) internal {
         IBaseRewardPool rewarder = IBaseRewardPool(tokenToPoolInfo[_stakingToken].rewarder);
-        if (address(rewarder) != address(0))
-            rewarder.getReward(_account, _receiver);
+        if (address(rewarder) != address(0)) {
+            if (_rewardTokens.length > 0)
+                rewarder.getRewards(_account, _receiver, _rewardTokens);
+            else
+                // if not specifiying any reward token, just claim them all
+                rewarder.getReward(_account, _receiver);
+        }
     }
 
-        /// @notice Safe mgp transfer function, just in case if rounding error causes pool to not have enough MGPs.
-    function _safeMGPTransfer(address _stakingToken, address _account, address _receiver, uint256 _amount) internal {
-        if (_amount == 0)
-            return;
-
-        if (_stakingToken == address(vlmgp)) {  // vlMGP case
-            _sendMGPForVlMGPPool(_account, _receiver, _amount);
-        } else if(MPGRewardPool[_stakingToken]) { // MGP reward pool case
-            _sendMGP(_account, _receiver, _amount);
-        } else { // default
-            _sendVlMGPFor(_account, _receiver, _amount);
-        }
+    /// only update the reward counting on in base rewarder but not sending them to user
+    function _harvestBaseRewarder(address _stakingToken, address _account) internal {
+        IBaseRewardPool rewarder = IBaseRewardPool(tokenToPoolInfo[_stakingToken].rewarder);
+        if (address(rewarder) != address(0))
+            rewarder.updateFor(_account);
     }
 
     function _sendMGPForVlMGPPool(address _account, address _receiver, uint256 _amount) internal {
         address vlMGPRewarder = tokenToPoolInfo[address(vlmgp)].rewarder;
         IERC20(mgp).safeApprove(vlMGPRewarder, _amount);
-        IvlmgpPBaseRewarder(vlMGPRewarder).queueMGP(_amount, _receiver);
+        IvlmgpPBaseRewarder(vlMGPRewarder).queueMGP(_amount, _account, _receiver);
 
         emit HarvestMGP(_account, _receiver, _amount, false);
     }
@@ -599,7 +623,7 @@ contract MasterMagpie is Initializable, OwnableUpgradeable, ReentrancyGuardUpgra
         IERC20(mgp).safeTransfer(_receiver, _amount);
 
         emit HarvestMGP(_account, _receiver, _amount, false);
-    }    
+    }
 
     function _sendVlMGPFor(address _account, address _receiver, uint256 _amount) internal {
         IERC20(mgp).safeApprove(address(vlmgp), _amount);
@@ -608,7 +632,12 @@ contract MasterMagpie is Initializable, OwnableUpgradeable, ReentrancyGuardUpgra
         emit HarvestMGP(_account, _receiver, _amount, true);
     }
 
+    function _calLpSupply(address _stakingToken) internal view returns (uint256) {
+        if (_stakingToken == address(vlmgp))
+            return IERC20(address(vlmgp)).totalSupply();
 
+        return IERC20(_stakingToken).balanceOf(address(this));
+    }
 
     /* ============ Admin Functions ============ */
     /// @notice Used to give edit rights to the pools in this contract to a Pool Manager
@@ -681,7 +710,7 @@ contract MasterMagpie is Initializable, OwnableUpgradeable, ReentrancyGuardUpgra
         _onlyPoolManager
         returns (address)
     {
-        BaseRewardPool _rewarder = new BaseRewardPool(
+        BaseRewardPoolV2 _rewarder = new BaseRewardPoolV2(
             _stakingToken,
             mainRewardToken,
             address(this),
@@ -775,6 +804,14 @@ contract MasterMagpie is Initializable, OwnableUpgradeable, ReentrancyGuardUpgra
         );
     }
 
+    function setLegacyRewarder(address _stakingToken, address _legacyRewarder) external onlyOwner {
+        legacyRewarder[_stakingToken] = _legacyRewarder;
+    }
+
+    function setReferral(address _referral) external onlyOwner {
+        referral = _referral;
+    }    
+
     /// @notice Update the emission rate of MGP for MasterMagpie
     /// @param _mgpPerSec new emission per second
     function updateEmissionRate(uint256 _mgpPerSec) public onlyOwner {        
@@ -783,5 +820,29 @@ contract MasterMagpie is Initializable, OwnableUpgradeable, ReentrancyGuardUpgra
         mgpPerSec = _mgpPerSec;
 
         emit UpdateEmissionRate(msg.sender, oldEmissionRate, mgpPerSec);
+    }
+
+    function updatePoolsAlloc(address[] calldata _stakingTokens, uint256[] calldata _allocPoints) external onlyOwner {
+        massUpdatePools();
+
+        if (_stakingTokens.length != _allocPoints.length)
+            revert LengthMismatch();
+
+        for (uint256 i = 0; i < _stakingTokens.length; i++) {
+            uint256 oldAllocPoint = tokenToPoolInfo[_stakingTokens[i]].allocPoint;
+
+            totalAllocPoint = totalAllocPoint - oldAllocPoint + _allocPoints[i];
+
+            tokenToPoolInfo[_stakingTokens[i]].allocPoint = _allocPoints[i];
+
+            emit UpdatePoolAlloc(_stakingTokens[i], oldAllocPoint, _allocPoints[i]);
+        }
+    }
+
+    // BaseRewarePool manager functions
+
+    function updateRewarderManager(address _rewarder, address _manager, bool _allowed) external onlyOwner {
+        IBaseRewardPool rewarder = IBaseRewardPool(_rewarder);
+        rewarder.updateManager(_manager, _allowed);
     }
 }

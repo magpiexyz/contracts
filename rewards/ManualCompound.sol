@@ -10,7 +10,7 @@ import { IERC20, ERC20 } from "@openzeppelin/contracts/token/ERC20/ERC20.sol";
 
 import "../interfaces/IMasterMagpie.sol";
 import "../interfaces/ISimpleHelper.sol";
-import "../interfaces/IConvertor.sol";
+import "../interfaces/IConverter.sol";
 import "../interfaces/ILocker.sol";
 
 contract ManualCompound is Ownable {
@@ -50,35 +50,25 @@ contract ManualCompound is Ownable {
         masterMagpie = _masterMagpie;
     }
 
-    /* ============ Private Functions ============ */
-
-    function _approveTokenIfNeeded(
-        address token,
-        address _to,
-        uint256 _amount
-    ) private {
-        if (IERC20(token).allowance(address(this), _to) < _amount) {
-            IERC20(token).safeApprove(_to, 0);
-            IERC20(token).safeApprove(_to, _amount);
-        }
+    /* ============ Modifiers ============ */
+    modifier validRewardIndex(uint256 _index) {
+        if(_index >= rewards.length) revert InvalidIndex();
+        _;
     }
 
     /* ============ External Functions ============ */
 
-    function setHelper(uint256 _index, address _helper) external onlyOwner {
-        if(_index >= rewards.length) revert InvalidIndex();
+    function setHelper(uint256 _index, address _helper) external validRewardIndex(_index) onlyOwner {
         rewards[_index].tokenHelper = _helper;
         emit HelperSet(_index, _helper);
     }
 
-    function setConvertor(uint256 _index, address _convertor) external onlyOwner {
-        if(_index >= rewards.length) revert InvalidIndex();
+    function setConvertor(uint256 _index, address _convertor) validRewardIndex(_index) external onlyOwner {
         rewards[_index].convertor = _convertor;
         emit ConvertorSet(_index, _convertor);
     }
 
-    function setLocker(uint256 _index, address _locker) external onlyOwner {
-        if(_index >= rewards.length) revert InvalidIndex();
+    function setLocker(uint256 _index, address _locker) validRewardIndex(_index) external onlyOwner {
         rewards[_index].locker = _locker;
         emit LockerSet(_index, _locker);
     }
@@ -95,8 +85,7 @@ contract ManualCompound is Ownable {
         emit RewardAdded(_tokenAddress);
     }
 
-    function removeReward(uint256 _index, address _tokenAddress) external onlyOwner {
-        if(_index >= rewards.length) revert InvalidIndex();
+    function removeReward(uint256 _index, address _tokenAddress) validRewardIndex(_index) external onlyOwner {
         if(rewards[_index].tokenAddress != _tokenAddress) revert InvalidReward();
         for (uint i = _index; i < rewards.length - 1; i++) {
            rewards[i] = rewards[i+1];
@@ -127,21 +116,26 @@ contract ManualCompound is Ownable {
         locker = rewards[_index].locker;
     }
 
-    function compound(address[] calldata _lps, bool _forLock) external {
+    // @param _lps lp pool to claim reward from master magpie
+    // @param _convertRatio the percentage of total collected wom to convert to mWom with smart convert
+    // @param _minRec the expected min mWom to receive upon convert with smart wom convert
+    // @param _lockMgp the flag for if MGP should be locked
+    function compound(address[] calldata _lps, address[][] calldata _rewards, uint256 _convertRatio, uint256 _minRec, bool _lockMgp) external {
         uint256 rewardTokensLength = rewards.length;        
-        IMasterMagpie(masterMagpie).multiclaimOnBehalf(_lps, msg.sender);
-        address[] memory bonusTokenAddresses;
+        IMasterMagpie(masterMagpie).multiclaimOnBehalf(_lps, _rewards, msg.sender);
         // send none compoundable reward back to caller
         for(uint256 i; i < _lps.length; i++) {
-            (bonusTokenAddresses, ) = IMasterMagpie(masterMagpie).rewarderBonusTokenInfo(_lps[i]);
-            for (uint j; j < bonusTokenAddresses.length; j++) {
-                if (!compoundableRewards[bonusTokenAddresses[j]]) {
-                    uint256 rewardBalance = IERC20(bonusTokenAddresses[j]).balanceOf(address(this));
-                    IERC20(bonusTokenAddresses[j]).safeTransfer(msg.sender, rewardBalance);
+            uint256 rewardLength = _rewards[i].length;
+            if (rewardLength > 0) {
+                for (uint j; j < rewardLength; j++) {
+                    if (!compoundableRewards[_rewards[i][j]]) {
+                        uint256 rewardBalance = IERC20(_rewards[i][j]).balanceOf(address(this));
+                        if (rewardBalance > 0)
+                            IERC20(_rewards[i][j]).safeTransfer(msg.sender, rewardBalance);
+                    }
                 }
             }
         }
-
         for (uint256 i; i< rewardTokensLength; i++) {
             address _tokenAddress = rewards[i].tokenAddress;
             address _helperAddress = rewards[i].tokenHelper;
@@ -151,29 +145,20 @@ contract ManualCompound is Ownable {
 
             if (receivedBalance > 0) {
                 if (_convertor != address(0)) {
-                    _approveTokenIfNeeded(_tokenAddress, _convertor, receivedBalance);
-                    IConvertor(_convertor).deposit(receivedBalance);
-                    _tokenAddress = _convertor;
-                }
-
-                if(_locker == address(0) && _helperAddress == address(0)) {
-                    IERC20(_tokenAddress).safeTransfer(msg.sender, receivedBalance);
+                    IERC20(_tokenAddress).safeApprove(_convertor, receivedBalance);
+                    IConverter(_convertor).convertFor(receivedBalance, _convertRatio, _minRec, msg.sender, true);
+                } else if (_locker != address(0) && _lockMgp) {
+                    IERC20(_tokenAddress).safeApprove(_locker, receivedBalance);
+                    ILocker(_locker).lockFor(receivedBalance, msg.sender);                        
+                } else if (_helperAddress != address(0)) { 
+                    IERC20(_tokenAddress).safeApprove(_helperAddress, receivedBalance);
+                    ISimpleHelper(_helperAddress).depositFor(receivedBalance, msg.sender);
                 } else {
-                    // lock has higher priority over stake
-                    if(_locker != address(0) && _forLock) {
-                        _approveTokenIfNeeded(_tokenAddress, _locker, receivedBalance);
-                        ILocker(_locker).lockFor(receivedBalance, msg.sender);
-                        continue;
-                    }
-
-                    if (_helperAddress != address(0)) {
-                        _approveTokenIfNeeded(_tokenAddress, _helperAddress, receivedBalance);
-                        ISimpleHelper(_helperAddress).depositFor(receivedBalance, msg.sender);
-                    }
+                    IERC20(_tokenAddress).safeTransfer(msg.sender, receivedBalance);
                 }
             }
         }
 
-        emit Compounded(msg.sender, rewardTokensLength, _forLock);
+        emit Compounded(msg.sender, rewardTokensLength, _lockMgp);
     }
 }
