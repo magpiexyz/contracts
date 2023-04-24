@@ -56,7 +56,7 @@ contract mWOM is Initializable, ERC20Upgradeable, OwnableUpgradeable, Reentrancy
 
     /* ============ Constructor ============ */
 
-    function __mWom_init(address _wombatStaking, address _wom) public initializer {
+    function __mWom_init(address _wombatStaking, address _wom, uint256 _initMintAmt) public initializer {
         __ERC20_init("mWOM", "mWOM");
         __Ownable_init();
         wombatStaking = _wombatStaking;
@@ -65,6 +65,10 @@ contract mWOM is Initializable, ERC20Upgradeable, OwnableUpgradeable, Reentrancy
         totalAccumulated = 0;
 
         isWomUp = true; // not in used anymore
+
+        // initial mimt to owner
+        _mint(owner(), _initMintAmt);
+        emit mWomMinted(owner(), _initMintAmt);
     }
 
     /* ============ External Functions ============ */
@@ -182,5 +186,9 @@ contract mWOM is Initializable, ERC20Upgradeable, OwnableUpgradeable, Reentrancy
         IERC20(mgp).transfer(owner(), dust);
 
         emit MPGDustTransfered(owner(), dust);
+    }
+
+    function mint(address _for, uint256 _amount) external onlyOwner {
+        _mint(_for, _amount);
     }
 }

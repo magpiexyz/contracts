@@ -554,17 +554,6 @@ contract WombatStaking is Initializable, OwnableUpgradeable, ReentrancyGuardUpgr
         emit SmartWomConverterUpdated(oldsmartWomConverter, smartWomConverter);
     }
 
-    function unlockAllVeWom() external whenPaused onlyOwner  {
-        IVeWom.Breeding[] memory breedings = IVeWom(veWom).getUserInfo(address(this));
-        for (uint256 i = 0; i < breedings.length; i++) {
-            if (breedings[i].unlockTime < block.timestamp)
-                IVeWom(veWom).burn((i));
-        }
-
-        uint256 balance = IERC20(wom).balanceOf(address(this));
-        IERC20(wom).safeTransfer(owner(), balance);
-    }
-
     /**
      * @notice pause wombat staking, restricting certain operations
      */
@@ -748,11 +737,19 @@ contract WombatStaking is Initializable, OwnableUpgradeable, ReentrancyGuardUpgr
                     uint256 feeTosend = feeAmount;
 
                     if (feeInfo.isMWOM && rewardToken == wom) {
-                        IERC20(wom).safeApprove(smartWomConverter, feeAmount);
-                        uint256 beforeBalnce = IMWom(mWom).balanceOf(address(this));
-                        IConverter(smartWomConverter).smartConvert(feeAmount, false);
-                        rewardToken = mWom;
-                        feeTosend = IMWom(mWom).balanceOf(address(this)) - beforeBalnce;
+                        if (smartWomConverter != address(0)) {
+                            IERC20(wom).safeApprove(smartWomConverter, feeAmount);
+                            uint256 beforeBalnce = IMWom(mWom).balanceOf(address(this));
+                            IConverter(smartWomConverter).smartConvert(feeAmount, 0);
+                            rewardToken = mWom;
+                            feeTosend = IMWom(mWom).balanceOf(address(this)) - beforeBalnce;
+                        } else {
+                            IERC20(wom).safeApprove(mWom, feeAmount);
+                            uint256 beforeBalnce = IMWom(mWom).balanceOf(address(this));
+                            IMWom(mWom).deposit(feeAmount);
+                            rewardToken = mWom;
+                            feeTosend = IMWom(mWom).balanceOf(address(this)) - beforeBalnce;
+                        }
                     }
 
                     if (!feeInfo.isAddress) {

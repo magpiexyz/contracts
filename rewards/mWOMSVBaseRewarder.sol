@@ -8,18 +8,18 @@ import { OwnableUpgradeable } from "@openzeppelin/contracts-upgradeable/access/O
 import { ReentrancyGuardUpgradeable } from '@openzeppelin/contracts-upgradeable/security/ReentrancyGuardUpgradeable.sol';
 import { PausableUpgradeable } from '@openzeppelin/contracts-upgradeable/security/PausableUpgradeable.sol';
 
-import "../interfaces/IVLMGP.sol";
+import "../interfaces/ILocker.sol";
 import "../interfaces/IMasterMagpie.sol";
-import "../interfaces/IvlmgpPBaseRewarder.sol";
+import "../interfaces/IBaseRewardPool.sol";
 
 /// @title A contract for managing rewards for a pool
 /// @author Magpie Team
 /// @notice You can use this contract for getting informations about rewards for a specific pools
-contract vlMGPBaseRewarder is IvlmgpPBaseRewarder, Initializable, OwnableUpgradeable, ReentrancyGuardUpgradeable {
+contract mWOMSVBaseRewarder is IBaseRewardPool, Initializable, OwnableUpgradeable, ReentrancyGuardUpgradeable {
     using SafeERC20 for IERC20;
     using SafeERC20 for IERC20Metadata;
 
-    IVLMGP public vlMGP; 
+    ILocker public mWOMSV; 
 
     /* ============ State Variables ============ */
 
@@ -44,7 +44,7 @@ contract vlMGPBaseRewarder is IvlmgpPBaseRewarder, Initializable, OwnableUpgrade
 
     /* ==== variable added for first upgrade === */
 
-    uint256 public constant vlMGPDecimal = 18;
+    uint256 public constant mWOMSVDecimal = 18;
 
     /* ============ Events ============ */
 
@@ -62,26 +62,27 @@ contract vlMGPBaseRewarder is IvlmgpPBaseRewarder, Initializable, OwnableUpgrade
     error OnlyMasterMagpie();
     error NotAllowZeroAddress();
     error InvalidRewardableAmount();
+    error MustBeRewardToken();
 
     /* ============ Constructor ============ */
 
-    function __vlMGPBaseRewarder_init(
-        address _vlMGP,
+    function __mWOMSVBaseRewarder_init(
+        address _mWOMSV,
         address _rewardToken,
         address _masterMagpie,
         address _rewardManager
     ) public initializer {
         __Ownable_init();
         if(
-            _vlMGP == address(0) ||
+            _mWOMSV == address(0) ||
             _masterMagpie  == address(0) ||
             _rewardManager  == address(0)
         ) revert NotAllowZeroAddress();
 
-        stakingToken = _vlMGP;
+        stakingToken = _mWOMSV;
         masterMagpie = _masterMagpie;
         managers[_rewardManager] = true;
-        vlMGP = IVLMGP(_vlMGP);
+        mWOMSV = ILocker(_mWOMSV);
 
         if (_rewardToken != address(0)) {
             rewards[_rewardToken] = Reward({
@@ -99,14 +100,14 @@ contract vlMGPBaseRewarder is IvlmgpPBaseRewarder, Initializable, OwnableUpgrade
 
     modifier updateRewards(address _account, address[] memory _rewards) {
         uint256 length = _rewards.length;
-        uint256 userVlMGPAmount = balanceOf(_account);
+        uint256 usermWOMSVAmount = balanceOf(_account);
         
         for (uint256 index = 0; index < length; ++index) {
             address rewardToken = _rewards[index];
             if (userRewardPerTokenPaid[rewardToken][_account] == rewardPerToken(rewardToken))
                 continue;
 
-            userRewards[rewardToken][_account] = _earned(_account, rewardToken, userVlMGPAmount);
+            userRewards[rewardToken][_account] = _earned(_account, rewardToken, usermWOMSVAmount);
             userRewardPerTokenPaid[rewardToken][_account] = rewardPerToken(rewardToken);
         }
         _;
@@ -135,7 +136,7 @@ contract vlMGPBaseRewarder is IvlmgpPBaseRewarder, Initializable, OwnableUpgrade
     /// amount of MGP still in lock + amount of MGP in cool down / 2
     /// @return Returns current amount of staked tokens
     function totalStaked() public override view returns (uint256) {
-        return IERC20(address(vlMGP)).totalSupply();
+        return IERC20(address(mWOMSV)).totalSupply();
     }
 
     /// @notice Returns lock weighting of an user. Lock weighting is calculated by 
@@ -150,7 +151,7 @@ contract vlMGPBaseRewarder is IvlmgpPBaseRewarder, Initializable, OwnableUpgrade
     /// @notice Returns decimals of staking token
     /// @return Returns decimals of staking token
     function stakingDecimals() public override pure returns (uint256) {
-        return vlMGPDecimal;
+        return mWOMSVDecimal;
     }
 
     /// @notice Returns amount of reward token per staking tokens in pool
@@ -271,23 +272,6 @@ contract vlMGPBaseRewarder is IvlmgpPBaseRewarder, Initializable, OwnableUpgrade
         emit ManagerUpdated(_rewardManager, managers[_rewardManager]);
     }
 
-    function queueMGP(uint256 _amount, address _account, address _receiver) override external onlyManager nonReentrant returns (bool) {
-        IERC20(vlMGP.MGP()).safeTransferFrom(msg.sender, address(this), _amount);
-        
-        uint256 forfeitAmount = _calExpireForfeit(_account, _amount);
-        uint256 rewardableAmount = _amount - forfeitAmount;
-        
-        if (forfeitAmount > 0)
-            _queueNewRewardsWithoutTransfer(forfeitAmount, address(vlMGP.MGP()));
-
-        if (rewardableAmount > 0) {
-            IERC20(vlMGP.MGP()).safeTransfer(_receiver, rewardableAmount);
-            emit MGPHarvested(_account, rewardableAmount, forfeitAmount);
-        }
-
-        return true;
-    }
-
     /// @notice Sends new rewards to be distributed to the users staking. Only callable by manager
     /// @param _amountReward Amount of reward token to be distributed
     /// @param _rewardToken Address reward token
@@ -301,6 +285,24 @@ contract vlMGPBaseRewarder is IvlmgpPBaseRewarder, Initializable, OwnableUpgrade
             rewardTokens.push(_rewardToken);
             isRewardToken[_rewardToken] = true;
         }
+
+        _provisionReward(_amountReward, _rewardToken);
+        return true;
+    }
+
+    /// @notice Sends new rewards to be distributed to the users staking. Only possible to donate already registered token
+    /// @param _amountReward Amount of reward token to be distributed
+    /// @param _rewardToken Address reward token
+    function donateRewards(uint256 _amountReward, address _rewardToken) external {
+        if (!isRewardToken[_rewardToken])
+            revert MustBeRewardToken();
+
+        _provisionReward(_amountReward, _rewardToken);
+    }    
+
+    /* ============ Internal Functions ============ */
+
+    function _provisionReward(uint256 _amountReward, address _rewardToken) internal {
         IERC20Metadata(_rewardToken).safeTransferFrom(
             msg.sender,
             address(this),
@@ -320,13 +322,10 @@ contract vlMGPBaseRewarder is IvlmgpPBaseRewarder, Initializable, OwnableUpgrade
             }
             rewardInfo.rewardPerTokenStored =
                 rewardInfo.rewardPerTokenStored +
-                (_amountReward * 10**vlMGPDecimal) / totalStaked();
+                (_amountReward * 10**mWOMSVDecimal) / totalStaked();
         }
         emit RewardAdded(_amountReward, _rewardToken);
-        return true;
     }
-
-    /* ============ Internal Functions ============ */
 
     function _queueNewRewardsWithoutTransfer(uint256 _amountReward, address _rewardToken) internal
     {
@@ -341,21 +340,21 @@ contract vlMGPBaseRewarder is IvlmgpPBaseRewarder, Initializable, OwnableUpgrade
             }
             rewardInfo.rewardPerTokenStored =
                 rewardInfo.rewardPerTokenStored +
-                (_amountReward * 10**vlMGPDecimal) / totalStaked();
+                (_amountReward * 10**mWOMSVDecimal) / totalStaked();
         }
         emit ForfeitRewardAdded(_amountReward, _rewardToken);
     }
 
     function _updateFor(address _account) internal {
         uint256 length = rewardTokens.length;
-        uint256 userVlMGPAmount = balanceOf(_account);
+        uint256 userMWOMSVAmount = balanceOf(_account);
 
         for (uint256 index = 0; index < length; ++index) {
             address rewardToken = rewardTokens[index];
             if (userRewardPerTokenPaid[rewardToken][_account] == rewardPerToken(rewardToken))
                 continue;
 
-            userRewards[rewardToken][_account] = _earned(_account, rewardToken, userVlMGPAmount);
+            userRewards[rewardToken][_account] = _earned(_account, rewardToken, userMWOMSVAmount);
             userRewardPerTokenPaid[rewardToken][_account] = rewardPerToken(rewardToken);
         }
     }
@@ -376,16 +375,15 @@ contract vlMGPBaseRewarder is IvlmgpPBaseRewarder, Initializable, OwnableUpgrade
             _queueNewRewardsWithoutTransfer(forfeitAmount, _rewardToken);
     }
 
-    function _earned(address _account, address _rewardToken, uint256 _userVlmgpShare) internal view returns (uint256) {
-        return ((_userVlmgpShare *
+    function _earned(address _account, address _rewardToken, uint256 _userMWOMSVShare) internal view returns (uint256) {
+        return ((_userMWOMSVShare *
                 (rewardPerToken(_rewardToken) -
                     userRewardPerTokenPaid[_rewardToken][_account])) /
-                10**vlMGPDecimal) + userRewards[_rewardToken][_account];
+                10**mWOMSVDecimal) + userRewards[_rewardToken][_account];
     }
 
     function _calExpireForfeit(address _account, uint256 _amount) internal view returns (uint256) {
-        uint256 rewardablePercentWAD = vlMGP.getRewardablePercentWAD(_account);
-        uint256 rewardableAmount = _amount * rewardablePercentWAD / 1e18;
+        uint256 rewardableAmount = _amount;
         if (rewardableAmount > _amount)
             revert InvalidRewardableAmount();
 

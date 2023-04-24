@@ -10,6 +10,7 @@ import "../interfaces/wombat/IMWom.sol";
 import "../interfaces/wombat/IAsset.sol";
 import "../interfaces/ISimpleHelper.sol";
 import "../interfaces/IMasterMagpie.sol";
+import "../interfaces/ILocker.sol";
 
 /// @title Smart Convertor
 /// @author Magpie Team
@@ -20,7 +21,7 @@ contract SmartWomConvert is ISimpleHelper, Ownable {
     /* ============ State Variables ============ */
 
     address public immutable mWom;
-    address public immutable wom;
+    address public immutable wom;    
     address public immutable router;
     address public immutable womMWomPool;
     address public immutable masterMagpie;
@@ -30,6 +31,7 @@ contract SmartWomConvert is ISimpleHelper, Ownable {
     uint256 public constant WAD = 1e18;
     uint256 public ratio;
     uint256 public buybackThreshold;
+    ILocker public mWomSV;
 
     /* ============ Errors ============ */
     
@@ -40,13 +42,14 @@ contract SmartWomConvert is ISimpleHelper, Ownable {
 
     /* ============ Events ============ */
 
-    event mWomConverted(address user, uint256 depositedWom, uint256 obtainedmWom, bool stake);
+    event mWomConverted(address user, uint256 depositedWom, uint256 obtainedmWom, uint256 mode);
 
     /* ============ Constructor ============ */
 
     constructor(
         address _mwom,
         address _wom,
+        address _mWomSV,
         address _router,
         address _womMWomPool,
         address _masterMagpie,
@@ -60,6 +63,7 @@ contract SmartWomConvert is ISimpleHelper, Ownable {
         masterMagpie = _masterMagpie;
         womAsset = _womAsset;
         ratio = _ratio;
+        mWomSV = ILocker(_mWomSV);
         buybackThreshold = 9000;
     }
 
@@ -114,19 +118,19 @@ contract SmartWomConvert is ISimpleHelper, Ownable {
 
     /* ============ External Functions ============ */
 
-    function convert(uint256 _amountIn, uint256 _convertRatio, uint256 _minRec, bool _stake) external returns (uint256 obtainedmWomAmount) {
-        obtainedmWomAmount = _convertFor(_amountIn, _convertRatio, _minRec, msg.sender, _stake);
+    function convert(uint256 _amountIn, uint256 _convertRatio, uint256 _minRec, uint256 _mode) external returns (uint256 obtainedmWomAmount) {
+        obtainedmWomAmount = _convertFor(_amountIn, _convertRatio, _minRec, msg.sender, _mode);
     }
 
-    function convertFor(uint256 _amountIn, uint256 _convertRatio, uint256 _minRec, address _for, bool _stake)
+    function convertFor(uint256 _amountIn, uint256 _convertRatio, uint256 _minRec, address _for, uint256 _mode)
         external
         returns (uint256 obtainedmWomAmount)
     {
-        obtainedmWomAmount = _convertFor(_amountIn, _convertRatio, _minRec, _for, _stake);
+        obtainedmWomAmount = _convertFor(_amountIn, _convertRatio, _minRec, _for, _mode);
     }
 
     // should mainly used by wombat staking upon sending wom
-    function smartConvert(uint256 _amountIn, bool _stake) external returns (uint256 obtainedmWomAmount) {
+    function smartConvert(uint256 _amountIn, uint256 _mode) external returns (uint256 obtainedmWomAmount) {
         if (_amountIn == 0) revert MustNoBeZero();
 
         uint256 convertRatio = DENOMINATOR;
@@ -139,7 +143,7 @@ contract SmartWomConvert is ISimpleHelper, Ownable {
             convertRatio = convertAmount * DENOMINATOR / _amountIn;
         }
 
-        return _convertFor(_amountIn, convertRatio, _amountIn, msg.sender, _stake);
+        return _convertFor(_amountIn, convertRatio, _amountIn, msg.sender, _mode);
     }
 
     function depositFor(uint256 _amount, address _for) override external {
@@ -168,7 +172,7 @@ contract SmartWomConvert is ISimpleHelper, Ownable {
 
     /* ============ Internal Functions ============ */
 
-    function _convertFor(uint256 _amount, uint256 _convertRatio, uint256 _minRec, address _for, bool _stake)
+    function _convertFor(uint256 _amount, uint256 _convertRatio, uint256 _minRec, address _for, uint256 _mode)
         internal returns (uint256 obtainedmWomAmount) {
 
         if (_convertRatio > DENOMINATOR)
@@ -202,13 +206,16 @@ contract SmartWomConvert is ISimpleHelper, Ownable {
 
         obtainedmWomAmount = convertAmount + amountRec;
 
-        if (_stake) {
+        if (_mode == 1) {
             IERC20(mWom).safeApprove(masterMagpie, obtainedmWomAmount);
             IMasterMagpie(masterMagpie).depositFor(mWom, obtainedmWomAmount, _for);
-            emit mWomConverted(_for, _amount, obtainedmWomAmount, true);
+        } else if (_mode == 2) {
+            IERC20(mWom).safeApprove(address(mWomSV), obtainedmWomAmount);
+            mWomSV.lockFor(obtainedmWomAmount, _for);
         } else {
             IERC20(mWom).safeTransfer(_for, obtainedmWomAmount);
-            emit mWomConverted(_for, _amount, obtainedmWomAmount, false);
         }
+
+        emit mWomConverted(_for, _amount, obtainedmWomAmount, _mode);
     }
 }

@@ -15,7 +15,6 @@ import "./BaseRewardPoolV2.sol";
 import "../interfaces/IBaseRewardPool.sol";
 import "../interfaces/IvlmgpPBaseRewarder.sol";
 import "../interfaces/IHarvesttablePoolHelper.sol";
-import "../interfaces/IVLMGP.sol";
 import "../interfaces/ILocker.sol";
 import "../interfaces/IReferralStorage.sol";
 
@@ -71,7 +70,7 @@ contract MasterMagpie is Initializable, OwnableUpgradeable, ReentrancyGuardUpgra
     // The MGP TOKEN!
     MGP public mgp;
 
-    IVLMGP public vlmgp;
+    ILocker public vlmgp;
 
     // MGP tokens created per second.
     uint256 public mgpPerSec;
@@ -105,6 +104,10 @@ contract MasterMagpie is Initializable, OwnableUpgradeable, ReentrancyGuardUpgra
     /* ==== variable added for third upgrade === */
 
     address public referral;
+
+    /* ==== variable added for fourth upgrade === */
+
+    ILocker public mWomSV;
 
     /* ============ Events ============ */
 
@@ -148,8 +151,9 @@ contract MasterMagpie is Initializable, OwnableUpgradeable, ReentrancyGuardUpgra
     event UpdateEmissionRate(address indexed _user, uint256 _oldMgpPerSec, uint256 _newMgpPerSec);
     event UpdatePoolAlloc(address _stakingToken, uint256 _oldAllocPoint, uint256 _newAllocPoint);
     event PoolManagerStatus(address _account, bool _status);
-    event CompounderUpated(address _newCompounder, address _oldCompounder);
+    event CompounderUpdated(address _newCompounder, address _oldCompounder);
     event VLMGPUpdated(address _newVlmgp, address _oldVlmgp);
+    event MWomSVpdated(address _mWomSV, address _oldMWomSV);
     event DepositNotAvailable(address indexed _user,  address indexed _stakingToken, uint256 _amount);
     event MGPSet(address _mgp);
     event LockFreePoolUpdated(address _stakingToken, bool _isRewardMGP);    
@@ -165,7 +169,7 @@ contract MasterMagpie is Initializable, OwnableUpgradeable, ReentrancyGuardUpgra
     error UnlockAmountExceedsLocked();
     error MustBeContractOrZero();
     error OnlyCompounder();
-    error OnlyVlMgp();
+    error OnlyLocker();
     error MGPsetAlready();
     error MustBeContract();
     error LengthMismatch();
@@ -202,9 +206,15 @@ contract MasterMagpie is Initializable, OwnableUpgradeable, ReentrancyGuardUpgra
 
     modifier _onlyVlMgp() {
         if (msg.sender != address(vlmgp))
-            revert OnlyVlMgp();
+            revert OnlyLocker();
         _;
     }
+
+    modifier _onlyMWomSV() {
+        if (msg.sender != address(mWomSV))
+            revert OnlyLocker();
+        _;
+    }    
 
     modifier _onlyCompounder() {
         if (msg.sender != compounder)
@@ -452,6 +462,20 @@ contract MasterMagpie is Initializable, OwnableUpgradeable, ReentrancyGuardUpgra
         _withdraw(address(vlmgp), _for, _amount, true);
     }
 
+    function depositMWomSVFor(
+        uint256 _amount,
+        address _for
+    ) external whenNotPaused _onlyMWomSV() {
+        _deposit(address(mWomSV), _for, _amount, true);
+    }
+    
+    function withdrawMWomSVFor(
+        uint256 _amount,
+        address _for
+    ) external whenNotPaused _onlyMWomSV() {
+        _withdraw(address(mWomSV), _for, _amount, true);
+    }    
+
     /* ============ Internal Functions ============ */
 
     /// @notice internal function to deal with deposit staking token
@@ -551,7 +575,7 @@ contract MasterMagpie is Initializable, OwnableUpgradeable, ReentrancyGuardUpgra
 
         uint256 totalReward = vlMGPPoolAmount + mWOmPoolAmount + defaultPoolAmount;
 
-        if (totalReward > 0) {
+        if (totalReward > 0 && referral != address(0)) {
             IReferralStorage(referral).trigger(_user, totalReward);
         }
     }
@@ -633,9 +657,12 @@ contract MasterMagpie is Initializable, OwnableUpgradeable, ReentrancyGuardUpgra
     }
 
     function _calLpSupply(address _stakingToken) internal view returns (uint256) {
-        if (_stakingToken == address(vlmgp))
+        if (_stakingToken == address(vlmgp)) {
             return IERC20(address(vlmgp)).totalSupply();
-
+        }
+        if (_stakingToken == address(mWomSV)) {
+            return IERC20(address(mWomSV)).totalSupply();
+        }
         return IERC20(_stakingToken).balanceOf(address(this));
     }
 
@@ -669,7 +696,7 @@ contract MasterMagpie is Initializable, OwnableUpgradeable, ReentrancyGuardUpgra
     {
         address oldCompounder = compounder;
         compounder = _compounder;
-        emit CompounderUpated(compounder, oldCompounder);
+        emit CompounderUpdated(compounder, oldCompounder);
     }
 
     function setVlmgp(address _vlmgp)
@@ -677,8 +704,14 @@ contract MasterMagpie is Initializable, OwnableUpgradeable, ReentrancyGuardUpgra
         onlyOwner
     {
         address oldVlmgp = address(vlmgp);
-        vlmgp = IVLMGP(_vlmgp);
-        emit VLMGPUpdated(address(vlmgp), oldVlmgp);
+        vlmgp = ILocker(_vlmgp);
+    }
+
+    function setMWomSV(address _mWomSV)
+        external
+        onlyOwner
+    {
+        mWomSV = ILocker(_mWomSV);
     }
 
     function setMGPRewardPools(address _stakingToken, bool _isLockFree) external onlyOwner {

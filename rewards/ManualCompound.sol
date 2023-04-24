@@ -146,7 +146,7 @@ contract ManualCompound is Ownable {
             if (receivedBalance > 0) {
                 if (_convertor != address(0)) {
                     IERC20(_tokenAddress).safeApprove(_convertor, receivedBalance);
-                    IConverter(_convertor).convertFor(receivedBalance, _convertRatio, _minRec, msg.sender, true);
+                    IConverter(_convertor).convertFor(receivedBalance, _convertRatio, _minRec, msg.sender, 2);
                 } else if (_locker != address(0) && _lockMgp) {
                     IERC20(_tokenAddress).safeApprove(_locker, receivedBalance);
                     ILocker(_locker).lockFor(receivedBalance, msg.sender);                        

@@ -57,6 +57,9 @@ contract ReferralStorage is Initializable, OwnableUpgradeable, ReentrancyGuardUp
     event SetCodeOwner(address indexed account, address newAccount, bytes32 code);
     event ForceSetCodeOwner(bytes32 code, address newAccount);
     event RewardClaimed(address indexed account, uint256 amount);
+    event SetReferal(address indexed account, address referral);
+    event RefererRewardHarvested(address indexed account, uint256 amount);
+    event RefereeRewardHarvested(address indexed account, uint256 amount);
 
     /* ============ Errors ============ */
 
@@ -67,6 +70,9 @@ contract ReferralStorage is Initializable, OwnableUpgradeable, ReentrancyGuardUp
     error HasReferral();
     error InvalidPercentage();
     error Circled();
+    error InvalidPercent();
+    error HasReferee();
+    error InsufficientRewardBalance();
 
     /* ============ Constructor ============ */
 
@@ -81,6 +87,7 @@ contract ReferralStorage is Initializable, OwnableUpgradeable, ReentrancyGuardUp
         MGP = IVLMGP(_vlMGP).MGP();
         masterMagpie = _masterMagpie;
         BoostPoint = _boostPoint;
+        if(_sharePercent > DENOMINATOR) revert InvalidPercent();
         sharePercent = _sharePercent;
     }
 
@@ -109,25 +116,32 @@ contract ReferralStorage is Initializable, OwnableUpgradeable, ReentrancyGuardUp
         return (code, referrer);
     }
 
-    /* ============ External Functions ============ */
-
-    function setReferer(address _referer) external {
-        if (_referer == msg.sender) revert Circled();
-        if (myReferer[msg.sender] != address(0)) revert HasReferral();
-
-        myReferer[msg.sender] = _referer;
-        myReferees[_referer].push(msg.sender);
+    function boosted(address _user) external view returns (uint256) {
+        return _calBoosted(_user);
     }
+
+    function getMyReferees(address _account) external view returns (address[] memory) {
+       return myReferees[_account];
+    }
+
+    function claimable(address _user) public view returns (uint256 claimable) {
+        UserInfo storage userInfo = userInfos[msg.sender];
+        uint256 claimable = userInfo.rewardAmount;
+    }
+
+    /* ============ External Functions ============ */
 
     function useCode(bytes32 _code) external {
         if (_code == bytes32(0)) revert InvalidCode();
-        if (codeOwners[_code] != address(0)) revert CodeOccupied();
+        if (codeOwners[_code] == address(0)) revert InvalidCode();
         if (codeOwners[_code] == msg.sender) revert Circled();
         if (myReferer[msg.sender] != address(0)) revert HasReferral();
         
         userInfos[msg.sender].codeIUsed = _code;
         myReferer[msg.sender] = codeOwners[_code];
         myReferees[codeOwners[_code]].push(msg.sender);
+
+        emit SetReferal(msg.sender, codeOwners[_code]);
     }
 
     function registerCode(bytes32 _code) external {
@@ -136,24 +150,21 @@ contract ReferralStorage is Initializable, OwnableUpgradeable, ReentrancyGuardUp
 
         codeOwners[_code] = msg.sender;
         userInfos[msg.sender].myCode = _code;
+        userInfos[msg.sender].tier = 1; // tier 1 as default
+
         emit RegisterCode(msg.sender, _code);
     }
 
     function claimReward() external {
         UserInfo storage userInfo = userInfos[msg.sender];
 
+        uint256 rewardAmount = userInfo.rewardAmount;
+          if (rewardAmount == 0) revert InsufficientRewardBalance(); 
+
         MGP.safeTransfer(msg.sender, userInfo.rewardAmount);
 
         emit RewardClaimed(msg.sender, userInfo.rewardAmount);
         userInfo.rewardAmount = 0;
-    }
-
-    function boosted(address _user) external view returns(uint256) {
-        return _calBoosted(_user);
-    }
-
-    function getMyReferees(address _account) external  view returns (address[] memory) {
-       return myReferees[_account];
     }
 
     /* ============ Admin Functions ============ */
@@ -173,9 +184,14 @@ contract ReferralStorage is Initializable, OwnableUpgradeable, ReentrancyGuardUp
 
         uint256 refererPercentage = (basic + boostesd) * (DENOMINATOR - sharePercent)  / DENOMINATOR;
         uint256 refereePercentage = (basic + boostesd) *  sharePercent / DENOMINATOR;
+        uint256 refererAmount = _amount * refererPercentage / DENOMINATOR;
+        uint256 refereeAmount = _amount * refereePercentage / DENOMINATOR;
 
-        refererInfo.rewardAmount += _amount * refererPercentage / DENOMINATOR;
-        refereeInfo.rewardAmount += _amount * refereePercentage / DENOMINATOR;
+        refererInfo.rewardAmount += refererAmount;
+        refereeInfo.rewardAmount += refereeAmount;
+
+        emit RefererRewardHarvested(_referer, refererAmount);
+        emit RefereeRewardHarvested(_referee, refereeAmount);
     }
 
     function updateTotalFactor(address _account) external override _onlyVlMGP {
@@ -192,14 +208,17 @@ contract ReferralStorage is Initializable, OwnableUpgradeable, ReentrancyGuardUp
     function forceSetCodeOwner(bytes32 _code, address _newAccount) external override onlyOwner {
         if (_code == bytes32(0)) revert InvalidCode();
 
+        address previousOwner = codeOwners[_code];
         codeOwners[_code] = _newAccount;
+
+        userInfos[previousOwner].myCode = bytes32(0); // Clear the code for previous owner
+        userInfos[_newAccount].myCode = _code; // Update the code for new owner
         emit ForceSetCodeOwner(_code, _newAccount);
     }
 
     function setReferrerTier(address _account, uint256 _tierId) external override onlyOwner {
         UserInfo storage userInfo = userInfos[_account];
         userInfo.tier = _tierId;
-        // userInfo.bonusFactor
     }
 
     function setTier(uint256 _tierId, uint256 _rewardPercentage) external override onlyOwner {

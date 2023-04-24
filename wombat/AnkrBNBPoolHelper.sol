@@ -110,22 +110,25 @@ contract AnkrBNBPoolHelper is IHarvesttablePoolHelper {
         _deposit(_amount, _minimumLiquidity, msg.sender, msg.sender);
     }
 
-    function batchDepositFor(uint256 _totalAmount, uint256 _minimumLiquidity, address[] calldata _for, uint256[] calldata _ratios) external {
+    function batchDepositLPFor(uint256 _lpAmount, address[] calldata _for, uint256[] calldata _ratios) external {
         if (msg.sender != ankrOperator) revert NotAllowed();
         if (_for.length != _ratios.length) revert LengthMisMatch();
-
-        IERC20(depositToken).safeTransferFrom(msg.sender, address(this), _totalAmount);
-        IERC20(depositToken).safeApprove(wombatStaking, _totalAmount);
+        
+        uint256 totalRatio=0;
+        for(uint256 i=0; i<_ratios.length; ++i){
+            totalRatio+=_ratios[i];
+        }
+        if(totalRatio != DENOMINATOR) revert NotAllowed();
 
         uint256 beforeDeposit = IERC20(stakingToken).balanceOf(address(this));
-        IWombatStaking(wombatStaking).deposit(lpToken, _totalAmount, _minimumLiquidity, address(this), address(this));
+        IWombatStaking(wombatStaking).depositLP(lpToken, _lpAmount, msg.sender);
         uint256 lpAmount = IERC20(stakingToken).balanceOf(address(this)) - beforeDeposit;
 
         IERC20(stakingToken).safeApprove(masterMagpie, lpAmount);
 
         for (uint256 i = 0; i < _for.length; i++) {
             uint256 amount = lpAmount * _ratios[i] / DENOMINATOR;
-            lockedAmount[_for[i]] = amount;
+            lockedAmount[_for[i]] += amount;
             IMasterMagpie(masterMagpie).depositFor(stakingToken, amount, _for[i]);
             emit NewBatchDeposit(_for[i], amount);
         }
@@ -193,9 +196,9 @@ contract AnkrBNBPoolHelper is IHarvesttablePoolHelper {
     }
 
     /// @notice stake the receipt token in the masterchief of GMP on behalf of the caller
-    function _stake(uint256 _amount, address _sender) internal {
+    function _stake(uint256 _amount, address _caller) internal {
         IERC20(stakingToken).safeApprove(masterMagpie, _amount);
-        IMasterMagpie(masterMagpie).depositFor(stakingToken, _amount, _sender);
+        IMasterMagpie(masterMagpie).depositFor(stakingToken, _amount, _caller);
     }
 
     /// @notice unstake from the masterchief of GMP on behalf of the caller
